@@ -26,34 +26,187 @@ extern "C" {
 #pragma GCC target("avx2", "bmi", "bmi2", "lzcnt")
 #endif
 
-SZ_API_COMPTIME sz_cptr_t sz_find_byte_haswell(sz_cptr_t haystack, sz_size_t haystack_length, sz_cptr_t needle) {
-    int matches_mask;
-    sz_u256_vec_t haystack_vec, needle_vec;
-    needle_vec.ymm = _mm256_set1_epi8(needle[0]);
+/**
+ *  @brief  Searches a haystack shorter than 32 bytes without a byte-by-byte loop: two overlapping 16-byte loads
+ *          for 16-31 bytes, two overlapping 8-byte words for 8-15, and two 4-byte words packed into one 64-bit
+ *          word for 4-7. Every load stays inside the haystack. Lane @b i of the returned mask stands for byte
+ *          @b i for the first word, and for byte `length - width + i` for the second, so the lowest set lane is
+ *          the first match and the highest set lane is the last one.
+ */
+SZ_HELPER_INLINE sz_u32_t sz_find_byte_short_mask_haswell_(sz_u8_t const *text, sz_size_t length, sz_u8_t needle) {
+    sz_assert_(length >= 16 && length < 32);
+    __m128i const needle_u8x16 = _mm_set1_epi8((char)needle);
+    sz_u32_t const head_mask = (sz_u32_t)_mm_movemask_epi8(
+        _mm_cmpeq_epi8(_mm_loadu_si128((__m128i const *)text), needle_u8x16));
+    sz_u32_t const tail_mask = (sz_u32_t)_mm_movemask_epi8(
+        _mm_cmpeq_epi8(_mm_loadu_si128((__m128i const *)(text + length - 16)), needle_u8x16));
+    return head_mask | (tail_mask << (length - 16));
+}
 
-    while (haystack_length >= 32) {
-        haystack_vec.ymm = _mm256_lddqu_si256((__m256i const *)haystack);
-        matches_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(haystack_vec.ymm, needle_vec.ymm));
-        if (matches_mask) return haystack + (int)_tzcnt_u32(matches_mask);
-        haystack += 32, haystack_length -= 32;
+SZ_API_COMPTIME sz_cptr_t sz_find_byte_haswell(sz_cptr_t haystack, sz_size_t haystack_length, sz_cptr_t needle) {
+    sz_u8_t const *const text = (sz_u8_t const *)haystack;
+    sz_u8_t const needle_byte = *(sz_u8_t const *)needle;
+
+    // Inputs under 32 bytes: overlapping loads that stay inside the haystack, instead of a byte-by-byte loop.
+    if (haystack_length < 32) {
+        if (haystack_length >= 16) {
+            sz_u32_t const matches = sz_find_byte_short_mask_haswell_(text, haystack_length, needle_byte);
+            return matches ? haystack + sz_u32_ctz(matches) : SZ_NULL_CHAR;
+        }
+        sz_u64_vec_t needle_vec;
+        needle_vec.u64 = (sz_u64_t)needle_byte * 0x0101010101010101ull;
+        if (haystack_length >= 8) {
+            sz_u64_vec_t const head = sz_u64_each_byte_equal_(sz_u64_load(haystack), needle_vec);
+            if (head.u64) return haystack + sz_u64_ctz(head.u64) / 8;
+            sz_u64_vec_t const tail = sz_u64_each_byte_equal_(sz_u64_load(haystack + haystack_length - 8), needle_vec);
+            return tail.u64 ? haystack + haystack_length - 8 + sz_u64_ctz(tail.u64) / 8 : SZ_NULL_CHAR;
+        }
+        if (haystack_length >= 4) {
+            // Bytes [0, 4) in the low half, bytes [length - 4, length) in the high half.
+            sz_u64_vec_t both;
+            both.u64 = (sz_u64_t)sz_u32_load(haystack).u32 |
+                       ((sz_u64_t)sz_u32_load(haystack + haystack_length - 4).u32 << 32);
+            sz_u64_vec_t const matches = sz_u64_each_byte_equal_(both, needle_vec);
+            if (!matches.u64) return SZ_NULL_CHAR;
+            sz_size_t const lane = (sz_size_t)sz_u64_ctz(matches.u64) / 8;
+            return haystack + (lane < 4 ? lane : haystack_length - 8 + lane);
+        }
+        return sz_find_byte_serial(haystack, haystack_length, needle);
     }
 
-    return sz_find_byte_serial(haystack, haystack_length, needle);
+    __m256i const needle_u8x32 = _mm256_set1_epi8((char)needle_byte);
+    sz_u8_t const *const end = text + haystack_length;
+    sz_u32_t matches = (sz_u32_t)_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)text), needle_u8x32));
+    if (matches) return haystack + sz_u32_ctz(matches);
+    if (haystack_length <= 64) {
+        // One more block, overlapping the first one, finishes the input.
+        matches = (sz_u32_t)_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)(end - 32)), needle_u8x32));
+        return matches ? (sz_cptr_t)(end - 32 + sz_u32_ctz(matches)) : SZ_NULL_CHAR;
+    }
+    // The second block, before any loop: a match there costs no more than it did with one block per iteration.
+    matches = (sz_u32_t)_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)(text + 32)), needle_u8x32));
+    if (matches) return haystack + 32 + sz_u32_ctz(matches);
+
+    // Inputs of 256 bytes or more continue from the next 32-byte boundary, which the first two blocks have already
+    // reached, so that no load straddles two cache lines: worth 1.2-1.6x from 1 KB up, and nothing below 256 bytes.
+    // Then test four blocks per iteration and branch once on their union.
+    sz_u8_t const *cursor = haystack_length >= 256 ? (sz_u8_t const *)(((sz_size_t)text + 64) & ~(sz_size_t)31)
+                                                   : text + 64;
+    for (; end - cursor >= 128; cursor += 128) {
+        __m256i const first_u8x32 = _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)cursor), needle_u8x32);
+        __m256i const second_u8x32 = _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)(cursor + 32)),
+                                                       needle_u8x32);
+        __m256i const third_u8x32 = _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)(cursor + 64)), needle_u8x32);
+        __m256i const fourth_u8x32 = _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)(cursor + 96)),
+                                                       needle_u8x32);
+        __m256i const any_u8x32 = _mm256_or_si256(_mm256_or_si256(first_u8x32, second_u8x32),
+                                                  _mm256_or_si256(third_u8x32, fourth_u8x32));
+        if (!_mm256_movemask_epi8(any_u8x32)) continue;
+        // Two 64-bit masks, so that locating the match takes at most two tests.
+        sz_u64_t const low_matches = (sz_u64_t)(sz_u32_t)_mm256_movemask_epi8(first_u8x32) |
+                                     ((sz_u64_t)(sz_u32_t)_mm256_movemask_epi8(second_u8x32) << 32);
+        if (low_matches) return (sz_cptr_t)(cursor + sz_u64_ctz(low_matches));
+        sz_u64_t const high_matches = (sz_u64_t)(sz_u32_t)_mm256_movemask_epi8(third_u8x32) |
+                                      ((sz_u64_t)(sz_u32_t)_mm256_movemask_epi8(fourth_u8x32) << 32);
+        return (sz_cptr_t)(cursor + 64 + sz_u64_ctz(high_matches));
+    }
+    for (; end - cursor >= 32; cursor += 32) {
+        matches = (sz_u32_t)_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)cursor), needle_u8x32));
+        if (matches) return (sz_cptr_t)(cursor + sz_u32_ctz(matches));
+    }
+    if (cursor == end) return SZ_NULL_CHAR;
+
+    // The last 32 bytes overlap blocks already tested: drop their lanes.
+    matches = (sz_u32_t)_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)(end - 32)), needle_u8x32));
+    matches >>= 32 - (end - cursor);
+    return matches ? (sz_cptr_t)(cursor + sz_u32_ctz(matches)) : SZ_NULL_CHAR;
 }
 
 SZ_API_COMPTIME sz_cptr_t sz_rfind_byte_haswell(sz_cptr_t haystack, sz_size_t haystack_length, sz_cptr_t needle) {
-    int matches_mask;
-    sz_u256_vec_t haystack_vec, needle_vec;
-    needle_vec.ymm = _mm256_set1_epi8(needle[0]);
+    sz_u8_t const *const text = (sz_u8_t const *)haystack;
+    sz_u8_t const needle_byte = *(sz_u8_t const *)needle;
 
-    while (haystack_length >= 32) {
-        haystack_vec.ymm = _mm256_lddqu_si256((__m256i const *)(haystack + haystack_length - 32));
-        matches_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(haystack_vec.ymm, needle_vec.ymm));
-        if (matches_mask) return haystack + haystack_length - 1 - (int)_lzcnt_u32(matches_mask);
-        haystack_length -= 32;
+    // Inputs under 32 bytes: the mirror image of `sz_find_byte_haswell`, taking the highest match.
+    if (haystack_length < 32) {
+        if (haystack_length >= 16) {
+            sz_u32_t const matches = sz_find_byte_short_mask_haswell_(text, haystack_length, needle_byte);
+            return matches ? haystack + 31 - sz_u32_clz(matches) : SZ_NULL_CHAR;
+        }
+        sz_u64_vec_t needle_vec;
+        needle_vec.u64 = (sz_u64_t)needle_byte * 0x0101010101010101ull;
+        if (haystack_length >= 8) {
+            sz_u64_vec_t const tail = sz_u64_each_byte_equal_(sz_u64_load(haystack + haystack_length - 8), needle_vec);
+            if (tail.u64) return haystack + haystack_length - 8 + (63 - sz_u64_clz(tail.u64)) / 8;
+            sz_u64_vec_t const head = sz_u64_each_byte_equal_(sz_u64_load(haystack), needle_vec);
+            return head.u64 ? haystack + (63 - sz_u64_clz(head.u64)) / 8 : SZ_NULL_CHAR;
+        }
+        if (haystack_length >= 4) {
+            sz_u64_vec_t both;
+            both.u64 = (sz_u64_t)sz_u32_load(haystack).u32 |
+                       ((sz_u64_t)sz_u32_load(haystack + haystack_length - 4).u32 << 32);
+            sz_u64_vec_t const matches = sz_u64_each_byte_equal_(both, needle_vec);
+            if (!matches.u64) return SZ_NULL_CHAR;
+            sz_size_t const lane = (sz_size_t)(63 - sz_u64_clz(matches.u64)) / 8;
+            return haystack + (lane < 4 ? lane : haystack_length - 8 + lane);
+        }
+        return sz_rfind_byte_serial(haystack, haystack_length, needle);
     }
 
-    return sz_rfind_byte_serial(haystack, haystack_length, needle);
+    __m256i const needle_u8x32 = _mm256_set1_epi8((char)needle_byte);
+    sz_u8_t const *const end = text + haystack_length;
+    sz_u32_t matches = (sz_u32_t)_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)(end - 32)), needle_u8x32));
+    if (matches) return (sz_cptr_t)(end - 1 - sz_u32_clz(matches));
+    if (haystack_length <= 64) {
+        matches = (sz_u32_t)_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)text), needle_u8x32));
+        return matches ? haystack + 31 - sz_u32_clz(matches) : SZ_NULL_CHAR;
+    }
+    // The second-to-last block, before any loop.
+    matches = (sz_u32_t)_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)(end - 64)), needle_u8x32));
+    if (matches) return (sz_cptr_t)(end - 33 - sz_u32_clz(matches));
+
+    // Inputs of 256 bytes or more continue down from the 32-byte boundary at or above `end - 64`, which the last two
+    // blocks have already reached, as in `sz_find_byte_haswell`; shorter ones continue from `end - 64` itself.
+    sz_u8_t const *cursor = haystack_length >= 256 ? (sz_u8_t const *)(((sz_size_t)(end - 64) + 31) & ~(sz_size_t)31)
+                                                   : end - 64;
+    for (; cursor - text >= 128; cursor -= 128) {
+        __m256i const first_u8x32 = _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)(cursor - 128)),
+                                                      needle_u8x32);
+        __m256i const second_u8x32 = _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)(cursor - 96)),
+                                                       needle_u8x32);
+        __m256i const third_u8x32 = _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)(cursor - 64)), needle_u8x32);
+        __m256i const fourth_u8x32 = _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)(cursor - 32)),
+                                                       needle_u8x32);
+        __m256i const any_u8x32 = _mm256_or_si256(_mm256_or_si256(first_u8x32, second_u8x32),
+                                                  _mm256_or_si256(third_u8x32, fourth_u8x32));
+        if (!_mm256_movemask_epi8(any_u8x32)) continue;
+        // Two 64-bit masks, so that locating the match takes at most two tests.
+        sz_u64_t const high_matches = (sz_u64_t)(sz_u32_t)_mm256_movemask_epi8(third_u8x32) |
+                                      ((sz_u64_t)(sz_u32_t)_mm256_movemask_epi8(fourth_u8x32) << 32);
+        if (high_matches) return (sz_cptr_t)(cursor - 1 - sz_u64_clz(high_matches));
+        sz_u64_t const low_matches = (sz_u64_t)(sz_u32_t)_mm256_movemask_epi8(first_u8x32) |
+                                     ((sz_u64_t)(sz_u32_t)_mm256_movemask_epi8(second_u8x32) << 32);
+        return (sz_cptr_t)(cursor - 65 - sz_u64_clz(low_matches));
+    }
+    for (; cursor - text >= 32; cursor -= 32) {
+        matches = (sz_u32_t)_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)(cursor - 32)), needle_u8x32));
+        if (matches) return (sz_cptr_t)(cursor - 1 - sz_u32_clz(matches));
+    }
+    if (cursor == text) return SZ_NULL_CHAR;
+
+    // The first 32 bytes overlap blocks already tested: keep only the lanes below `cursor`.
+    matches = (sz_u32_t)_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(_mm256_loadu_si256((__m256i const *)text), needle_u8x32));
+    matches &= (sz_u32_t)((1ull << (cursor - text)) - 1);
+    return matches ? haystack + 31 - sz_u32_clz(matches) : SZ_NULL_CHAR;
 }
 
 SZ_API_COMPTIME sz_cptr_t sz_find_haswell(sz_cptr_t haystack, sz_size_t haystack_length, sz_cptr_t needle,

@@ -52,7 +52,7 @@
 #include <algorithm>     // `std::transform`
 #include <iterator>      // `std::distance`
 #include <map>           // `std::map`
-#include <memory>        // `std::allocator`
+#include <memory>        // `std::allocator`, `std::unique_ptr`
 #include <numeric>       // `std::accumulate`
 #include <random>        // `std::random_device`
 #include <set>           // `std::set`
@@ -936,6 +936,69 @@ void test_find_all() {
     byteset_backend_t const rfind_byteset_serial {"serial", sz_rfind_byteset_serial};
     for (byteset_backend_t const &backend : rfind_byteset_backends)
         test_byteset_equivalence(rfind_byteset_serial, backend, 200);
+}
+
+/** @brief Single-byte search backends compiled on this target, for `test_find_byte_all`. */
+struct byte_backend_t {
+    char const *name;
+    sz_find_byte_t find;
+    sz_find_byte_t rfind;
+};
+
+static byte_backend_t const byte_backends[] = {
+    {"dispatched", sz_find_byte, sz_rfind_byte},
+#if SZ_USE_WESTMERE
+    {"westmere", sz_find_byte_westmere, sz_rfind_byte_westmere},
+#endif
+#if SZ_USE_HASWELL
+    {"haswell", sz_find_byte_haswell, sz_rfind_byte_haswell},
+#endif
+#if SZ_USE_SKYLAKE
+    {"skylake", sz_find_byte_skylake, sz_rfind_byte_skylake},
+#endif
+#if SZ_USE_NEON
+    {"neon", sz_find_byte_neon, sz_rfind_byte_neon},
+#endif
+#if SZ_USE_SVE
+    {"sve", sz_find_byte_sve, sz_rfind_byte_sve},
+#endif
+};
+
+/**
+ *  @brief Sweeps the single-byte search backends over every haystack length up to 300 bytes, every alignment
+ *         within 32 bytes, and every match position, against the serial kernels.
+ *
+ *  The random substring tests draw haystacks from a three-letter alphabet, so a one-byte needle almost always
+ *  matches within the first few bytes and the kernels' tails are rarely reached. Here the haystack holds no
+ *  needle except at the planted positions: none, one, or two adjacent ones. Each haystack sits at the end of
+ *  its own heap block, so AddressSanitizer reports any load past it.
+ */
+void test_find_byte_all() {
+    char const needles[] = {'z', '\0', (char)0x80, (char)0xFF};
+    for (char const needle : needles) {
+        char const filler = 'a';
+        for (std::size_t length = 0; length <= 300; ++length) {
+            for (std::size_t offset = 0; offset != 32; ++offset) {
+                std::unique_ptr<char[]> block(new char[offset + length]);
+                char *const haystack = block.get() + offset;
+                for (std::size_t matches = 0; matches != 3; ++matches) {
+                    // With no match planted, one pass is enough.
+                    std::size_t const positions = matches == 0 ? 1 : length;
+                    for (std::size_t position = 0; position < positions; ++position) {
+                        std::memset(haystack, filler, length);
+                        if (matches >= 1) haystack[position] = needle;
+                        if (matches == 2 && position + 1 < length) haystack[position + 1] = needle;
+                        sz_cptr_t const first = sz_find_byte_serial(haystack, length, &needle);
+                        sz_cptr_t const last = sz_rfind_byte_serial(haystack, length, &needle);
+                        for (byte_backend_t const &backend : byte_backends) {
+                            verify(backend.find(haystack, length, &needle) == first);
+                            verify(backend.rfind(haystack, length, &needle) == last);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #pragma endregion // Drivers
